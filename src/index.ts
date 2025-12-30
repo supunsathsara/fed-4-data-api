@@ -8,7 +8,7 @@ import { connectDB } from "./infrastructure/db";
 import { initializeEnergyCron } from "./infrastructure/energy-generation-cron";
 
 const server = express();
-server.use(cors({ origin: "http://localhost:5173" }));
+server.use(cors());
 
 server.use(loggerMiddleware);
 
