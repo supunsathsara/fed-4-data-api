@@ -1,6 +1,5 @@
 import { NextFunction, Request, Response } from "express";
 import { getAuth } from "@clerk/express";
-import { User } from "../../infrastructure/entities/User";
 import { ForbiddenError, UnauthorizedError } from "../../domain/errors/errors";
 import { UserPublicMetadata } from "../../domain/types";
 
