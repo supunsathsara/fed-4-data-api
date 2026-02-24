@@ -1,75 +1,136 @@
 import cron from 'node-cron';
 import { EnergyGenerationRecord } from './entities/EnergyGenerationRecord';
+import { SolarUnit } from './entities/SolarUnit';
 
 /**
- * Calculate realistic energy generation based on timestamp
- * Uses seasonal variations and time-of-day multipliers
+ * Energy Generation Simulator
+ *
+ * In production, this cron would NOT exist — real IoT devices would POST
+ * readings via the /api/ingest endpoint. This simulator exists to:
+ *
+ * 1. Generate realistic test data during development
+ * 2. Demonstrate the system with multiple solar units
+ * 3. Simulate varying conditions (weather, panel orientation, capacity)
+ *
+ * Each registered unit gets its own simulated readings based on its:
+ * - capacity (Watts)
+ * - location (latitude affects daylight hours)
+ * - metadata.tiltAngle / azimuth (affects efficiency)
  */
-function calculateEnergyGeneration(timestamp: Date): number {
+
+/**
+ * Calculate realistic energy generation for a specific solar unit
+ * Takes into account the unit's capacity, location, and panel characteristics
+ */
+export function calculateEnergyGeneration(
+  timestamp: Date,
+  unit: {
+    capacity: number;
+    location?: { latitude?: number } | null;
+    metadata?: { tiltAngle?: number; azimuth?: number } | null;
+  }
+): number {
   const hour = timestamp.getUTCHours();
-  const month = timestamp.getUTCMonth(); // 0-11
+  const month = timestamp.getUTCMonth();
+  const latitude = unit.location?.latitude ?? 7.0; // Default: ~Sri Lanka
 
-  // Base energy generation (higher in summer months)
-  let baseEnergy = 200;
-  if (month >= 5 && month <= 7) {
-    // June-August (summer)
-    baseEnergy = 300;
-  } else if (month >= 2 && month <= 4) {
-    // March-May (spring)
-    baseEnergy = 250;
-  } else if (month >= 8 && month <= 10) {
-    // September-November (fall)
-    baseEnergy = 200;
-  } else {
-    // December-February (winter)
-    baseEnergy = 150;
-  }
+  // Scale base energy relative to capacity (normalized to 5000W reference)
+  const capacityFactor = unit.capacity / 5000;
 
-  // Adjust based on time of day (solar panels generate more during daylight)
-  let timeMultiplier = 1;
+  // Seasonal variation based on latitude
+  // Higher latitudes have more dramatic seasonal shifts
+  const latFactor = Math.abs(latitude) / 90; // 0 (equator) → 1 (pole)
+  const seasonAngle = ((month - 5.5) / 6) * Math.PI; // Peak at June
+  const seasonMultiplier =
+    latitude >= 0
+      ? 1 + latFactor * 0.5 * Math.cos(seasonAngle) // Northern hemisphere
+      : 1 - latFactor * 0.5 * Math.cos(seasonAngle); // Southern hemisphere
+
+  const baseEnergy = 200 * capacityFactor * seasonMultiplier;
+
+  // Time-of-day solar curve (bell curve peaking at solar noon)
+  let timeMultiplier = 0;
   if (hour >= 6 && hour <= 18) {
-    // Daylight hours
-    timeMultiplier = 1.2;
-    if (hour >= 10 && hour <= 14) {
-      // Peak sun hours
-      timeMultiplier = 1.5;
-    }
-  } else {
-    // Night hours
-    timeMultiplier = 0;
+    // Gaussian-like curve centered at noon (hour 12)
+    const hoursFromNoon = Math.abs(hour - 12);
+    timeMultiplier = Math.exp(-0.15 * hoursFromNoon * hoursFromNoon);
   }
 
-  // Add some random variation (±20%)
-  const variation = 0.8 + Math.random() * 0.4;
-  const energyGenerated = Math.round(baseEnergy * timeMultiplier * variation);
+  // Panel efficiency modifiers
+  const tiltAngle = unit.metadata?.tiltAngle ?? 30;
+  const tiltEfficiency = 1 - Math.abs(tiltAngle - latitude) * 0.005; // Optimal tilt ≈ latitude
 
-  return energyGenerated;
+  // Random variation (±15%) — simulates cloud cover, dust, etc.
+  const variation = 0.85 + Math.random() * 0.3;
+
+  const energyGenerated = Math.round(
+    baseEnergy * timeMultiplier * tiltEfficiency * variation
+  );
+
+  return Math.max(0, energyGenerated);
 }
 
 /**
- * Generate a new energy generation record for the current time
+ * Generate simulated sensor metadata
  */
-async function generateNewRecord() {
+function simulateSensorMetadata(energyGenerated: number, hour: number) {
+  if (energyGenerated === 0) {
+    return { voltage: 0, current: 0, temperature: 20 + Math.random() * 5, irradiance: 0 };
+  }
+  const irradiance = 200 + Math.random() * 800; // W/m²
+  const temperature = 25 + (irradiance / 100) + Math.random() * 10; // Panel heats up with irradiance
+  const voltage = 230 + Math.random() * 20; // Grid voltage ~230-250V
+  const current = energyGenerated / voltage;
+
+  return {
+    voltage: Math.round(voltage * 10) / 10,
+    current: Math.round(current * 100) / 100,
+    temperature: Math.round(temperature * 10) / 10,
+    irradiance: Math.round(irradiance),
+  };
+}
+
+/**
+ * Generate a new energy generation record for ALL registered online units
+ */
+async function generateRecordsForAllUnits() {
   try {
     const timestamp = new Date();
-    const serialNumber = process.env.SOLAR_UNIT_SERIAL || 'SU-0001';
+    const hour = timestamp.getUTCHours();
 
-    const energyGenerated = calculateEnergyGeneration(timestamp);
+    // Find all ONLINE units (OFFLINE and MAINTENANCE units don't produce)
+    const onlineUnits = await SolarUnit.find({ status: 'ONLINE' });
 
-    const record = {
-      serialNumber,
-      timestamp,
-      energyGenerated,
-      intervalHours: 2,
-    };
+    if (onlineUnits.length === 0) {
+      console.log(`[Energy Sim] No online units found — skipping`);
+      return;
+    }
 
-    await EnergyGenerationRecord.create(record);
+    const records = onlineUnits.map((unit) => {
+      const energyGenerated = calculateEnergyGeneration(timestamp, unit);
+      const sensorMeta = simulateSensorMetadata(energyGenerated, hour);
+
+      return {
+        serialNumber: unit.serialNumber,
+        timestamp,
+        energyGenerated,
+        intervalHours: 2,
+        metadata: {
+          ...sensorMeta,
+          source: 'simulation' as const,
+        },
+      };
+    });
+
+    await EnergyGenerationRecord.insertMany(records);
+
+    const total = records.reduce((sum, r) => sum + r.energyGenerated, 0);
     console.log(
-      `[${timestamp.toISOString()}] Generated energy record: ${energyGenerated}Wh for ${serialNumber}`
+      `[Energy Sim] ${timestamp.toISOString()} — Generated ${records.length} records (${total} Wh total) for units: ${onlineUnits.map((u) => u.serialNumber).join(', ')}`
     );
   } catch (error) {
     console.error(
-      `[${new Date().toISOString()}] Failed to generate energy record:`,
+      `[Energy Sim] ${new Date().toISOString()} — Failed to generate records:`,
       error
     );
   }
@@ -77,16 +138,16 @@ async function generateNewRecord() {
 
 /**
  * Initialize the cron scheduler to generate energy records every 2 hours
+ * for ALL registered solar units
  */
 export const initializeEnergyCron = () => {
-  // Run every 2 hours on the hour (0 */2 * * *)
   const schedule = process.env.ENERGY_CRON_SCHEDULE || '0 */2 * * *';
 
   cron.schedule(schedule, async () => {
-    await generateNewRecord();
+    await generateRecordsForAllUnits();
   });
 
   console.log(
-    `[Energy Cron] Scheduler initialized - Energy generation records will be created at: ${schedule}`
+    `[Energy Cron] Simulator initialized — Records will be generated for all ONLINE units at: ${schedule}`
   );
 };
